@@ -31,7 +31,13 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum
+{
+  USB_STATE_IDLE = 0,
+  USB_STATE_CONNECTED,
+  USB_STATE_LOGGING,
+  USB_STATE_REMOVED
+} USB_State_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -51,6 +57,24 @@ UX_HOST_CLASS_STORAGE *usb_storage_instance = UX_NULL;
 UX_HOST_CLASS         *usb_host_class        = UX_NULL;
 volatile uint8_t       usb_disconnected      = 0;
 extern HCD_HandleTypeDef hhcd_USB_DRD_FS;
+
+/* ── Test instrumentation ── */
+volatile USB_State_t usb_state        = USB_STATE_IDLE;
+volatile uint32_t    missed_samples   = 0;
+volatile uint32_t    reconnect_count  = 0;
+volatile uint32_t    write_time_ms    = 0;
+volatile uint32_t    total_written    = 0;
+volatile int         buffer_level     = 0;
+volatile uint32_t    last_ts          = 0;
+volatile uint32_t    ts_errors        = 0;
+         uint8_t     file_index       = 1;
+volatile uint32_t    idle_count       = 0;
+static   uint32_t    idle_snap        = 0;
+static   uint32_t    session_start_ms = 0;
+static   uint8_t     file_is_open     = 0;   /* tracks whether log_file is open */
+static   FX_FILE     log_file;               /* persistent across sessions       */
+static   FX_MEDIA   *active_media     = NULL;
+static   uint32_t    idle_baseline    = 0;   /* idle ticks per 30s with no file I/O */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -58,7 +82,7 @@ static VOID app_ux_host_thread_entry(ULONG thread_input);
 static UINT ux_host_event_callback(ULONG event, UX_HOST_CLASS *current_class, VOID *current_instance);
 static VOID ux_host_error_callback(UINT system_level, UINT system_context, UINT error_code);
 /* USER CODE BEGIN PFP */
-
+static void logging_close(void);
 /* USER CODE END PFP */
 
 /**
@@ -161,31 +185,30 @@ static VOID app_ux_host_thread_entry(ULONG thread_input)
 
   UX_HOST_CLASS_STORAGE_MEDIA *storage_media;
   FX_MEDIA                    *media;
-  FX_FILE                      log_file;
   char                         batch[512];
   int                          offset;
   uint32_t                     sample_idx = 0;
   UINT                         status;
+  char                         fname[16];
 
   printf("USB Host thread started\r\n");
-  HAL_HCD_Start(&hhcd_USB_DRD_FS);   /* start USB host port now that scheduler is running */
+  HAL_HCD_Start(&hhcd_USB_DRD_FS);
   printf("USB Host started\r\n");
 
   while (1)
   {
     /* ── Wait for USB MSC device ── */
+    usb_state = USB_STATE_IDLE;
     while (usb_storage_instance == UX_NULL)
     {
       tx_thread_sleep(10);
     }
-
+    usb_state = USB_STATE_CONNECTED;
     printf("USB MSC ready - opening media\r\n");
 
     if (usb_host_class == UX_NULL) { usb_storage_instance = UX_NULL; continue; }
 
-    /* ── Media is already mounted by USBX when UX_DEVICE_INSERTION fires ── */
     storage_media = (UX_HOST_CLASS_STORAGE_MEDIA *)usb_host_class->ux_host_class_media;
-
     if (storage_media == UX_NULL ||
         storage_media->ux_host_class_storage_media_status != UX_HOST_CLASS_STORAGE_MEDIA_MOUNTED)
     {
@@ -195,59 +218,169 @@ static VOID app_ux_host_thread_entry(ULONG thread_input)
       usb_host_class       = UX_NULL;
       continue;
     }
-
     media = &storage_media->ux_host_class_storage_media;
 
-    /* ── Create CSV file (ignore FX_ALREADY_CREATED) ── */
-    fx_file_create(media, "log.csv");
+    /* ── Find next unused log file index ── */
+    file_index    = 1;
+    total_written = 0;
+    {
+      FX_FILE probe;
+      UINT    probe_status;
+      while (file_index < 999)
+      {
+        snprintf(fname, sizeof(fname), "log_%03d.csv", file_index);
+        memset(&probe, 0, sizeof(FX_FILE));
+        probe_status = fx_file_open(media, &probe, fname, FX_OPEN_FOR_READ);
+        if (probe_status == FX_NOT_FOUND)
+          break;                         /* truly does not exist — use this index */
+        if (probe_status == FX_SUCCESS)
+          fx_file_close(&probe);         /* exists and opened cleanly — skip      */
+        /* FX_ALREADY_OPEN also means file exists — skip                          */
+        file_index++;
+      }
+    }
+    /* ── Gracefully close any file left open from a previous session ── */
+    logging_close();
 
-    status = fx_file_open(media, &log_file, "log.csv", FX_OPEN_FOR_WRITE);
+    printf("New session file: %s\r\n", fname);
+    fx_file_create(media, fname);
+    status = fx_file_open(media, &log_file, fname, FX_OPEN_FOR_WRITE);
     if (status != FX_SUCCESS)
     {
       printf("File open FAIL: 0x%lX\r\n", (ULONG)status);
       usb_storage_instance = UX_NULL;
       continue;
     }
-
-    /* ── Write CSV header ── */
+    active_media = media;
+    file_is_open = 1;
     char *hdr = "timestamp_ms,voltage_v,current_a,flow_lpm\r\n";
     fx_file_write(&log_file, hdr, (ULONG)strlen(hdr));
-    printf("Logging started\r\n");
 
-    offset = 0;
+    usb_state        = USB_STATE_LOGGING;
+    offset           = 0;
+    session_start_ms = HAL_GetTick();
+
+    /* Capture true baseline: system is stable, USB connected, but no file I/O yet */
+    {
+      uint32_t t0 = idle_count;
+      tx_thread_sleep(300);                        /* measure over 3 seconds      */
+      idle_baseline = (idle_count - t0) * 10;     /* scale up to 30s window      */
+    }
+    idle_snap = idle_count;
+    printf("Logging started -> %s  [FREQ=%d ticks] baseline=%lu\r\n",
+           fname, TEST_FREQ, idle_baseline);
 
     /* ── Logging loop ── */
     while (!usb_disconnected)
     {
-      uint32_t ts       = HAL_GetTick();
-      float    voltage  = (float)(sample_idx % 400)  / 10.0f;   /* 0.0 – 39.9 V  */
-      float    current  = (float)(sample_idx % 6000) / 10.0f;   /* 0.0 – 599.9 A */
-      float    flow     = (float)(sample_idx % 50)   / 10.0f;   /* 0.0 – 4.9 LPM */
+      uint32_t ts      = HAL_GetTick();
+      float    voltage = (float)(sample_idx % 400)  / 10.0f;
+      float    current = (float)(sample_idx % 6000) / 10.0f;
+      float    flow    = (float)(sample_idx % 50)   / 10.0f;
       sample_idx++;
 
-      offset += snprintf(batch + offset, (int)sizeof(batch) - offset,
-                         "%lu,%.1f,%.1f,%.1f\r\n",
-                         ts, voltage, current, flow);
+      /* T02: timestamp monotonicity */
+      if (ts < last_ts) ts_errors++;
+      last_ts = ts;
 
+      /* T06: missed sample detection */
+      int line_len = snprintf(NULL, 0, "%lu,%.1f,%.1f,%.1f\r\n", ts, voltage, current, flow);
+      if (offset + line_len >= (int)sizeof(batch))
+      {
+        missed_samples++;
+      }
+      else
+      {
+        offset += snprintf(batch + offset, (int)sizeof(batch) - offset,
+                           "%lu,%.1f,%.1f,%.1f\r\n", ts, voltage, current, flow);
+      }
+      buffer_level = offset;
+
+      /* ── Batch flush ── */
       if (offset >= 480)
       {
+        uint32_t t0 = HAL_GetTick();
         fx_file_write(&log_file, batch, (ULONG)offset);
         fx_media_flush(media);
-        offset = 0;
+        write_time_ms  = HAL_GetTick() - t0;
+        total_written += (uint32_t)offset;
+        offset         = 0;
+        buffer_level   = 0;
+
+        /* T09/T10: file rotation */
+        if (total_written >= (uint32_t)FILE_ROTATE_SIZE_KB * 1024UL)
+        {
+          logging_close();
+          file_index++;
+          total_written = 0;
+          snprintf(fname, sizeof(fname), "log_%03d.csv", file_index);
+          fx_file_create(media, fname);
+          fx_file_open(media, &log_file, fname, FX_OPEN_FOR_WRITE);
+          active_media = media;
+          file_is_open = 1;
+          fx_file_write(&log_file, hdr, (ULONG)strlen(hdr));
+          printf("Rotated -> %s\r\n", fname);
+        }
       }
 
-      tx_thread_sleep(10);  /* 100 ms per sample (ThreadX tick = 10 ms) */
+      /* T14: time-based telemetry — single compact line every TELEMETRY_INTERVAL_MS */
+      {
+        static uint32_t last_telem_ms = 0;
+        uint32_t now = HAL_GetTick();
+        if (now - last_telem_ms >= TELEMETRY_INTERVAL_MS)
+        {
+          last_telem_ms = now;
+          ULONG64  free_space = 0;
+          uint32_t elapsed_ms = now - session_start_ms;
+          uint32_t throughput = elapsed_ms > 0 ? (total_written / (elapsed_ms / 1000 + 1)) : 0;
+          uint32_t idle_delta  = idle_count - idle_snap;
+          idle_snap            = idle_count;
+          /* CPU% = fraction of 30s window NOT spent in idle thread.
+           * idle_delta ticks / TELEMETRY_INTERVAL_MS ms gives idle rate.
+           * We report idle% directly — easier to interpret.
+           * idle_rate: ticks per ms in this window vs ticks per ms at system start. */
+          /* Idle ratio: idle_delta vs baseline — lower ratio = higher CPU load */
+          uint32_t idle_ratio_pct = (idle_baseline > 0)
+                                    ? (uint32_t)((uint64_t)idle_delta * 100ULL / idle_baseline)
+                                    : 0;
+          if (idle_ratio_pct > 100) idle_ratio_pct = 100;
+          uint32_t cpu_pct = 100 - idle_ratio_pct;
+          fx_media_extended_space_available(media, &free_space);
+
+          printf("[TELEM1] smp=%lu file=%s wkb=%lu free=%luGB reconn=%lu\r\n",
+                 sample_idx, fname, total_written / 1024,
+                 (ULONG)(free_space / (1024ULL * 1024ULL * 1024ULL)),
+                 reconnect_count);
+          printf("[TELEM2] wt=%lums tp=%luB/s buf=%d/512 miss=%lu tserr=%lu idle=%lu(ref=%lu)\r\n",
+                 write_time_ms, throughput, buffer_level,
+                 missed_samples, ts_errors, idle_delta, idle_baseline);
+        }
+      }
+
+#if TEST_FREQ > 0
+      tx_thread_sleep(TEST_FREQ);
+#else
+      tx_thread_relinquish();   /* yield to same-priority threads, no sleep */
+#endif
     }
 
-    /* ── Flush remaining data before removing device ── */
-    if (offset > 0)
+    /* ── Graceful disconnect: flush remaining batch then close ── */
+    if (offset > 0 && file_is_open)
     {
       fx_file_write(&log_file, batch, (ULONG)offset);
+      total_written += (uint32_t)offset;
+      offset = 0;
     }
+    logging_close();
+    reconnect_count++;
+    printf("USB safe to remove | %lu KB written | reconnects=%lu\r\n",
+           total_written / 1024, reconnect_count);
 
-    fx_file_close(&log_file);
-    fx_media_flush(media);
-    printf("File closed - USB safe to remove\r\n");
+    /* reset for next insertion */
+    missed_samples = 0;
+    ts_errors      = 0;
+    last_ts        = 0;
+    usb_disconnected = 0;
   }
   /* USER CODE END app_ux_host_thread_entry */
 }
@@ -373,5 +506,14 @@ VOID ux_host_error_callback(UINT system_level, UINT system_context, UINT error_c
 }
 
 /* USER CODE BEGIN 1 */
-
+static void logging_close(void)
+{
+  if (!file_is_open) return;
+  fx_file_close(&log_file);
+  if (active_media != NULL) fx_media_flush(active_media);
+  file_is_open  = 0;
+  active_media  = NULL;
+  usb_state     = USB_STATE_REMOVED;
+  printf("File closed gracefully\r\n");
+}
 /* USER CODE END 1 */

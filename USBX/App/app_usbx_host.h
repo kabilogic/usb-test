@@ -46,7 +46,25 @@ extern "C" {
 #define UX_HOST_APP_THREAD_PRIO         10
 
 /* USER CODE BEGIN EC */
+/* ── Test frequency modes (tx_thread_sleep ticks, 1 tick = 10 ms) ──
+ * TX_TIMER_TICKS_PER_SECOND = 100, so:
+ *   100 ticks =  1 Hz  (1 sample/sec)
+ *    10 ticks = 10 Hz  (10 samples/sec)
+ *     1 tick  = 100 Hz (100 samples/sec, minimum ThreadX resolution)
+ *     0       = max speed (no sleep, ~kHz range, stress only)
+ * True 1 kHz requires bypassing ThreadX sleep — use TEST_FREQ_MAX for stress.
+ */
+#define TEST_FREQ_1HZ          100
+#define TEST_FREQ_10HZ          10
+#define TEST_FREQ_100HZ          1
+#define TEST_FREQ_MAX            0   /* no sleep — stress/buffer test only */
+#define TEST_FREQ               TEST_FREQ_10HZ   /* 100Hz needs 2-thread design (T12) */
 
+/* File rotation threshold in KB (10240 = 10 MB, 51200 = 50 MB) */
+#define FILE_ROTATE_SIZE_KB     10240
+
+/* Telemetry print interval in milliseconds */
+#define TELEMETRY_INTERVAL_MS    30000UL
 /* USER CODE END EC */
 
 /* Exported macro ------------------------------------------------------------*/
